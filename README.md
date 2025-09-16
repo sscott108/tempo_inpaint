@@ -5,7 +5,7 @@ A PyTorch implementation of partial convolutional neural networks for satellite 
 ## Features
 - Partial Convolution U-Net architecture
 - Custom normalization for satellite imagery
-- Salt & pepper mask generation for data augmentation
+- random blob masking
 - Gradient-based texture analysis
 - Shapefile overlay visualization
 
