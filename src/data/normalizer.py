@@ -48,3 +48,7 @@ class Normalizer:
     def denormalize_image(self, z_float32):
         z = np.clip(z_float32.astype("float64"), -5, 5)  # match training range
         return np.expm1(z * self.im_sigma + self.im_mu)
+    
+    # normalizer.fit_images(train_files)
+# np.savez("normalizer_stats.npz",
+#          im_mu=normalizer.im_mu, im_sigma=normalizer.im_sigma)
