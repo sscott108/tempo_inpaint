@@ -1,9 +1,10 @@
-from .helpers import extract_timestamp_from_path, load_shapefile_segments_pyshp, visualize_batch, generate_realistic_gaps_simple
+from .helpers import extract_timestamp_from_path, load_shapefile_segments_pyshp, visualize_batch, generate_realistic_gaps_simple, _add_shape
 
 # Optional: specify what gets imported with "from utils import *"
 __all__ = [
     'extract_timestamp_from_path', 
     'load_shapefile_segments_pyshp',
     'visualize_batch',
-    'generate_realistic_gaps_simple'
+    'generate_realistic_gaps_simple',
+    '_add_shape'
 ]

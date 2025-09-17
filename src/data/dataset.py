@@ -89,7 +89,7 @@ class TempoInpaintDataset(Dataset):
             idx = np.random.randint(len(self))
         sample = self[idx]
 
-        inp_np = sample["img_w_both_masks"][0].numpy()
+        inp_np = sample["masked_img"][0].numpy()
         mask_obs = sample["known_mask"][0].numpy().astype(bool)
         mask_eff = sample["known_and_fake_mask"][0].numpy().astype(bool)
         targ = sample['target'][0].numpy()

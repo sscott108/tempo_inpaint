@@ -11,12 +11,13 @@ from matplotlib.collections import LineCollection
 from scipy import ndimage as ndi
 import rasterio
 from scipy.ndimage import gaussian_filter
+import torch
+from pyproj import CRS, Transformer
 
-
-def visualize_batch(epoch,model, dataset, idx, device="cuda", save=False, train = True, shp_path=None, avg_thr=0.2):
+def visualize_batch(epoch,model, normalizer, dataset, idx, device="cuda", save=False, train = True, shp_path=None, avg_thr=0.2):
     model.eval()
     sample = dataset[idx]   # dict: {"img_in","mask_in","target","path"}
-    img    = sample["img_w_both_masks"].unsqueeze(0).to(device)   # [1,1,H,W]
+    img    = sample["masked_img"].unsqueeze(0).to(device)   # [1,1,H,W]
     mask   = sample["known_and_fake_mask"].unsqueeze(0).to(device)  # [1,1,H,W]
     mask_obs = sample["known_mask"].unsqueeze(0).to(device)  #real missing tempo pixels, no fake mask
     target = sample["target"].unsqueeze(0).to(device)   # [1,1,H,W]
@@ -47,7 +48,7 @@ def visualize_batch(epoch,model, dataset, idx, device="cuda", save=False, train 
         H, W = src.height, src.width
         xmin, ymin, xmax, ymax = src.bounds
 
-    segments = _load_shapefile_segments_pyshp(shp_path, crs)
+    segments = load_shapefile_segments_pyshp(shp_path, crs)
     inv = ~tr
     seg_pix = []
     for seg in segments:
@@ -151,11 +152,11 @@ def _add_shape(ax, segments, alpha=1.0, color="k"):
     """Helper function to add shapefile overlay to plot"""
     ax.add_collection(LineCollection(segments, colors=color, linewidths=0.6, zorder=6, alpha=alpha))
     
-def load_shapefile_segments_pyshp(shp_path, target_crs):
+def load_shapefile_segments_pyshp(shp_path, target_crs, src_epsg = 4326):
     """
     Load shapefile segments and transform to target CRS
     """
-    src_crs = None  # You'll need to determine source CRS
+    src_crs = CRS.from_epsg(src_epsg)  # You'll need to determine source CRS
     tgt = target_crs if hasattr(target_crs, "to_wkt") else None
     if tgt is None:
         return None
