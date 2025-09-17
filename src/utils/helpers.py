@@ -13,141 +13,269 @@ import rasterio
 from scipy.ndimage import gaussian_filter
 import torch
 from pyproj import CRS, Transformer
+from scipy import stats
 
-def visualize_batch(epoch,model, normalizer, dataset, idx, device="cuda", save=False, train = True, shp_path=None, avg_thr=0.2):
+def visualize_batch(epoch, model, normalizer, dataloader, batch_idx=0, sample_idx=0, device="cuda", save=False, train=True, shp_path=None, avg_thr=0.2):
+    """
+    Visualize model predictions from a DataLoader
+    
+    Args:
+        epoch: Current epoch number
+        model: The model to evaluate
+        normalizer: Normalizer for denormalizing images
+        dataloader: DataLoader (either train or validation)
+        batch_idx: Which batch to use from the dataloader (default: 0)
+        sample_idx: Which sample within the batch to visualize (default: 0)
+        device: Device to run inference on
+        save: Whether to save the plot
+        train: Whether this is training data (affects what gets plotted)
+        shp_path: Path to shapefile for overlay
+        avg_thr: Threshold for texture analysis
+    """
     model.eval()
-    sample = dataset[idx]   # dict: {"img_in","mask_in","target","path"}
-    img    = sample["masked_img"].unsqueeze(0).to(device)   # [1,1,H,W]
-    mask   = sample["known_and_fake_mask"].unsqueeze(0).to(device)  # [1,1,H,W]
-    mask_obs = sample["known_mask"].unsqueeze(0).to(device)  #real missing tempo pixels, no fake mask
+    
+    # Get a batch from the dataloader
+    try:
+        # Get the specified batch
+        for i, batch in enumerate(dataloader):
+            if i == batch_idx:
+                break
+        else:
+            print(f"Batch index {batch_idx} not found in dataloader")
+            return
+    except Exception as e:
+        print(f"Error getting batch from dataloader: {e}")
+        return
+    
+    # Extract the specific sample from the batch
+    batch_size = batch["masked_img"].shape[0]
+    if sample_idx >= batch_size:
+        print(f"Sample index {sample_idx} not available in batch of size {batch_size}")
+        sample_idx = 0
+        print(f"Using sample index {sample_idx} instead")
+    
+    # Create sample dict by extracting the specific index from each tensor
+    sample = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            sample[key] = value[sample_idx]  # Extract specific sample
+        elif isinstance(value, (list, tuple)):
+            sample[key] = value[sample_idx]  # For paths or other list items
+        else:
+            sample[key] = value  # For single values
+
+#     print(f"Visualizing batch {batch_idx}, sample {sample_idx} from dataloader")
+    
+    # Get common data available in both train and val
+    img = sample["masked_img"].unsqueeze(0).to(device)   # [1,1,H,W]
+    mask_obs = sample["known_mask"].unsqueeze(0).to(device)  # real missing tempo pixels
     target = sample["target"].unsqueeze(0).to(device)   # [1,1,H,W]
     
-    if train: 
+    # For training, get additional masks
+    if train:
+        mask = sample["known_and_fake_mask"].unsqueeze(0).to(device)  # [1,1,H,W]
         fake_mask = sample['fake_mask'].unsqueeze(0).to(device)
-        fake_mask = fake_mask[0,0].cpu().numpy().astype(bool)
-        
-    with torch.no_grad():pred, out_mask  = model(img, mask)
+        fake_mask_np = fake_mask[0,0].cpu().numpy().astype(bool)
+    else:
+        # For validation, use only the known mask for inference
+        mask = mask_obs
     
-    inp_np   = normalizer.denormalize_image(img[0,0].cpu().numpy())
-    mask_np  = mask[0,0].cpu().numpy().astype(bool)   # 1=known
-    pred_np  = normalizer.denormalize_image(pred[0,0].cpu().numpy())
-    tgt_np   = normalizer.denormalize_image(target[0,0].cpu().numpy())
-    mask_obs = mask_obs[0,0].cpu().numpy().astype(bool)
+    # Get model prediction
+    with torch.no_grad():
+        pred, out_mask = model(img, mask)
     
-    holes_before = np.count_nonzero(~mask_np)
-    holes_filled = np.count_nonzero((~mask_np) & np.isfinite(pred_np))
-    fill_frac = 100.0 * holes_filled / max(holes_before, 1)
+    # Convert to numpy
+    inp_np = normalizer.denormalize_image(img[0,0].cpu().numpy())
+    mask_obs_np = mask_obs[0,0].cpu().numpy().astype(bool)   # 1=known
+    pred_np = normalizer.denormalize_image(pred[0,0].cpu().numpy())
+    tgt_np = normalizer.denormalize_image(target[0,0].cpu().numpy())
+    
+    if train:
+        mask_np = sample["known_and_fake_mask"][0].cpu().numpy().astype(bool)
+    else:
+        mask_np = mask_obs_np  # For validation, use only observed mask
 
+    # Extract metadata
     path = sample["path"]
     base = os.path.basename(path)
     ts = re.sub(r"\D", "", base)[:14]
     date = datetime.strptime(ts, "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
-    with rasterio.open(path) as src:
-        tr = src.transform
-        crs = src.crs
-        H, W = src.height, src.width
-        xmin, ymin, xmax, ymax = src.bounds
+    
+    # Load shapefile segments if provided
+    if shp_path is not None:
+        try:
+            with rasterio.open(path) as src:
+                tr = src.transform
+                crs = src.crs
+                H, W = src.height, src.width
 
-    segments = load_shapefile_segments_pyshp(shp_path, crs)
-    inv = ~tr
-    seg_pix = []
-    for seg in segments:
-        cols, rows = [], []
-        for x, y in seg:
-            c, r = inv * (x, y)
-            cols.append(c)
-            rows.append(r)
-        seg_pix.append(np.column_stack([cols, rows]))
-    segments = seg_pix
+            segments = load_shapefile_segments_pyshp(shp_path, crs)
+            if segments:
+                inv = ~tr
+                seg_pix = []
+                for seg in segments:
+                    cols, rows = [], []
+                    for x, y in seg:
+                        c, r = inv * (x, y)
+                        cols.append(c)
+                        rows.append(r)
+                    seg_pix.append(np.column_stack([cols, rows]))
+                segments = seg_pix
 
-    def _add_shape(a, alpha=1.0, color="k"):
-        a.add_collection(LineCollection(segments, colors=color, linewidths=0.6, zorder=6, alpha=alpha))
-    try:
-        gy = ndi.sobel(pred_np, axis=0); gx = ndi.sobel(pred_np, axis=1)
-    except Exception:
-        gy, gx = np.gradient(pred_np.astype(np.float32))
-    grad = np.hypot(gx, gy)
-
-    known_grad = grad[(mask_np) & np.isfinite(grad)]
-    if known_grad.size:
-        p10, p90 = np.percentile(known_grad, [10, 90])
-        scale = max(p90 - p10, 1e-6)
-        grad_norm = (grad - p10) / scale
+            def _add_shape(a, alpha=1.0, color="k"):
+                a.add_collection(LineCollection(segments, colors=color, linewidths=0.6, zorder=6, alpha=alpha))
+        except Exception as e:
+            print(f"Warning: Could not load shapefile: {e}")
+            def _add_shape(a, alpha=1.0, color="k"):
+                pass
     else:
-        grad_norm = grad
+        def _add_shape(a, alpha=1.0, color="k"):
+            pass  # Do nothing if no shapefile
 
-    avg_mask = (~mask_np) & (grad_norm < float(avg_thr))  # holes with low texture
-    avg_frac = 100.0 * (avg_mask.sum() / max((~mask_np).sum(), 1))
+    # Calculate performance metrics
+    holes_total = (~mask_np).sum()
+    holes_filled_valid = ((~mask_np) & np.isfinite(pred_np)).sum()
+    fill_percentage = 100.0 * holes_filled_valid / max(holes_total, 1)
 
+    # Calculate range consistency metric
+    holes_mask = ~mask_np
+    known_values = pred_np[mask_np]
+    filled_values = pred_np[holes_mask]
+    
+    range_consistency = 0.0
+    if len(known_values) > 0 and len(filled_values) > 0:
+        # Filter out NaN values
+        known_values_clean = known_values[np.isfinite(known_values)]
+        filled_values_clean = filled_values[np.isfinite(filled_values)]
+        
+        if len(known_values_clean) > 0 and len(filled_values_clean) > 0:
+            known_range = np.percentile(known_values_clean, [5, 95])
+            filled_in_range = np.sum((filled_values_clean >= known_range[0]) & 
+                                   (filled_values_clean <= known_range[1]))
+            range_consistency = 100.0 * filled_in_range / len(filled_values_clean)
+
+    # Set up colormap and scaling
     cmap_v = plt.cm.viridis.copy()
     cmap_v.set_bad(color="white")
-
     finite = np.isfinite(tgt_np)
     vmin, vmax = (np.percentile(tgt_np[finite], [2, 98]) if finite.any() else (0, 1))
     
-    inp_ma   = np.ma.array(inp_np,   mask=~mask_np)   # holes → white
-    tgt_ma   = np.ma.array(tgt_np,  mask=~np.isfinite(tgt_np))
-    pred_ma  = np.ma.array(pred_np, mask=np.isfinite(pred_np))
-    
     if train:
         sample_type = "Training"
-        fig, ax = plt.subplots(1, 5, figsize=(15, 8))
         
-        im0 = ax[0].imshow(np.ma.array(inp_np, mask=~mask_np), cmap=cmap_v, vmin=vmin, vmax=vmax,extent=(0, W, H, 0), origin="upper")
-        ax[0].set_title("Input (holes = white)");_add_shape(ax[0], color="k")
+        # Calculate gap statistics and RMSE for training
+        artificial_holes = mask_obs_np & (~fake_mask_np)  # Areas that were known but made into gaps
+        original_holes = (~mask_obs_np).sum()
+        artificial_gaps = artificial_holes.sum()
+        total_known_pixels = mask_obs_np.sum()
+        current_mask_np = mask_np 
+        gap_percentage = 100.0 * artificial_gaps / max(total_known_pixels, 1)
+        
+        known_mask_np = mask_obs_np  # Original TEMPO valid pixels
+        current_mask_np = mask_np    # Current mask (includes artificial holes)
+
+        # Artificial holes = areas that are valid in TEMPO but masked in current processing
+        artificial_holes = known_mask_np & (~current_mask_np)
+
+        if artificial_holes.sum() > 0:
+            pred_in_artificial = pred_np[artificial_holes]
+            target_in_artificial = tgt_np[artificial_holes]
+
+            # Remove any NaN values for RMSE calculation
+            valid_mask = np.isfinite(pred_in_artificial) & np.isfinite(target_in_artificial)
+            if valid_mask.sum() > 0:
+                pred_valid = pred_in_artificial[valid_mask]
+                target_valid = target_in_artificial[valid_mask]
+
+                rmse = np.sqrt(np.mean((pred_valid - target_valid)**2))
+
+                reconstruction_title = f"Reconstruction {fill_percentage:.1f}% filled, RMSE: {rmse:.3f}"
+
+                
+                # Convert RMSE to a percentage accuracy score
+                target_range = np.max(tgt_np[np.isfinite(tgt_np)]) - np.min(tgt_np[np.isfinite(tgt_np)])
+                accuracy_percentage = 100.0 * (1 - rmse / max(target_range, 1e-6))
+                accuracy_percentage = max(0, min(100, accuracy_percentage))
+                rho,_ = stats.spearmanr(pred_valid, target_valid)
+                reconstruction_title = f"Reconstruction\nRMSE: {rmse:.4E}|  $\\rho$: {rho:.2f}"
+   
+        
+        fig, ax = plt.subplots(1, 5, figsize=(20, 4))
+        
+        # Panel 0: Input with all holes (white)
+        im0 = ax[0].imshow(np.ma.array(inp_np, mask=~mask_np), cmap=cmap_v, vmin=vmin, vmax=vmax)
+        ax[0].set_title("Input (N/A = white)")
+        _add_shape(ax[0], color="k")
         fig.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04)
 
-        im1 = ax[1].imshow(fake_mask, cmap="gray", extent=(0, W, H, 0), origin="upper")
-        ax[1].set_title("Train Artificial Mask");_add_shape(ax[1], color="r")
-
-        im2 = ax[2].imshow(np.ma.array(pred_np, mask=~np.isfinite(pred_np)),cmap=cmap_v, vmin=vmin, vmax=vmax,extent=(0, W, H, 0), origin="upper", zorder=5)
-        ax[2].set_title(f"Reconstruction {avg_frac:.1f}%");_add_shape(ax[2], color="k")
+        # Panel 1: Artificial mask (fake holes) - WITH GAP PERCENTAGE
+        im1 = ax[1].imshow(~artificial_holes, cmap="Reds", alpha=0.8)
+        ax[1].set_title(f"Artificial Holes ({gap_percentage:.1f}%)")
+        _add_shape(ax[1], color="k")
+        
+        # Panel 2: Reconstruction - WITH RMSE
+        im2 = ax[2].imshow(np.ma.array(pred_np, mask=~np.isfinite(pred_np)), cmap=cmap_v, vmin=vmin, vmax=vmax)
+        ax[2].set_title(reconstruction_title)
+        _add_shape(ax[2], color="k")
         fig.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04)
 
-        # filled_only: prediction values only in holes
+        # Panel 3: Filled values only in holes - WITH RANGE CONSISTENCY
         filled_only = np.full_like(pred_np, np.nan, dtype=np.float32)
         filled_only[~mask_np] = pred_np[~mask_np]   # keep values only where mask==0
+        im3 = ax[3].imshow(np.ma.array(filled_only, mask=np.isnan(filled_only)), cmap=cmap_v, vmin=vmin, vmax=vmax)
+        ax[3].set_title(f"Filled Values in Holes")
+        _add_shape(ax[3], color="k")
+        fig.colorbar(im3, ax=ax[3], fraction=0.046, pad=0.04)
 
-        # masked array: holes show predictions, known pixels hidden
-        im3 = ax[3].imshow(np.ma.array(filled_only, mask=np.isnan(filled_only)),cmap=cmap_v, vmin=vmin, vmax=vmax,extent=(0, W, H, 0), origin="upper", zorder=5)
-        ax[3].set_title("Filled Values in Holes");_add_shape(ax[3], color="k");fig.colorbar(im3, ax=ax[3], fraction=0.046, pad=0.04)
-
-        im4 = ax[4].imshow(np.ma.array(tgt_np, mask=~mask_obs), cmap=cmap_v, vmin=vmin, vmax=vmax,extent=(0, W, H, 0), origin="upper")
-        ax[4].set_title("Input (holes = white)");_add_shape(ax[4],color="k")
+        # Panel 4: Target with original holes
+        im4 = ax[4].imshow(np.ma.array(tgt_np, mask=~mask_obs_np), cmap=cmap_v, vmin=vmin, vmax=vmax)
+        ax[4].set_title("Target (original holes = white)")
+        _add_shape(ax[4], color="k")
         fig.colorbar(im4, ax=ax[4], fraction=0.046, pad=0.04)
+        
     else:
         sample_type = "Validation"
-        fig, ax = plt.subplots(1, 4, figsize = (15,7))
         
-        im0 = ax[0].imshow(np.ma.array(inp_np, mask=~mask_np), cmap=cmap_v, vmin=vmin, vmax=vmax,extent=(0, W, H, 0), origin="upper")
-        ax[0].set_title("Input (holes = white)");_add_shape(ax[0], color="k")
-        fig.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04)  
+        fig, ax = plt.subplots(1, 4, figsize=(15, 5))
         
-        im1 = ax[1].imshow(mask_np, cmap="gray", extent=(0, W, H, 0), origin="upper")
-        ax[1].set_title("True Missing Mask");_add_shape(ax[1], color="r")
-
-        im2 = ax[2].imshow(np.ma.array(pred_np, mask=~np.isfinite(pred_np)),cmap=cmap_v, vmin=vmin, vmax=vmax,extent=(0, W, H, 0), origin="upper", zorder=5)
-        ax[2].set_title(f"Reconstruction {avg_frac:.1f}%");_add_shape(ax[2], color="k")
+        # Panel 0: Input with missing pixels as white
+        im0 = ax[0].imshow(np.ma.array(inp_np, mask=~mask_obs_np), cmap=cmap_v, vmin=vmin, vmax=vmax)
+        ax[0].set_title("Input (N/A = white)")
+        _add_shape(ax[0], color="k")
+        fig.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04)
+        
+        # Panel 1: Reconstruction
+        im1 = ax[1].imshow(np.ma.array(pred_np, mask=~np.isfinite(pred_np)), cmap=cmap_v, vmin=vmin, vmax=vmax)
+        ax[1].set_title("Reconstruction")
+        _add_shape(ax[1], color="k")
+        fig.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04)
+        
+        # Panel 2: Filled values only in holes - WITH RANGE CONSISTENCY
+        filled_only = np.full_like(pred_np, np.nan, dtype=np.float32)
+        filled_only[~mask_obs_np] = pred_np[~mask_obs_np]   # keep values only where mask==0
+        im2 = ax[2].imshow(np.ma.array(filled_only, mask=np.isnan(filled_only)), cmap=cmap_v, vmin=vmin, vmax=vmax)
+        ax[2].set_title(f"Filled Values in Holes")
+        _add_shape(ax[2], color="k")
         fig.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04)
 
-        # filled_only: prediction values only in holes
-        filled_only = np.full_like(pred_np, np.nan, dtype=np.float32)
-        filled_only[~mask_np] = pred_np[~mask_np]   # keep values only where mask==0
+        # Panel 3: Original target image (complete)
+        im3 = ax[3].imshow(np.ma.array(tgt_np, mask=~np.isfinite(tgt_np)), cmap=cmap_v, vmin=vmin, vmax=vmax)
+        ax[3].set_title("Target Image")
+        _add_shape(ax[3], color="k")
+        fig.colorbar(im3, ax=ax[3], fraction=0.046, pad=0.04)
 
-        # masked array: holes show predictions, known pixels hidden
-        im3 = ax[3].imshow(np.ma.array(filled_only, mask=np.isnan(filled_only)),cmap=cmap_v, vmin=vmin, vmax=vmax,extent=(0, W, H, 0), origin="upper", zorder=5)
-        ax[3].set_title("Target Image");_add_shape(ax[3], color="k");fig.colorbar(im3, ax=ax[3], fraction=0.046, pad=0.04)
-        
-    for a in ax: a.axis("off")
+    for a in ax: 
+        a.axis("off")
 
-    fig.suptitle(f" {sample_type} image {date}, epoch {epoch}", fontsize=16, y=0.79)
+    fig.suptitle(f"{sample_type} image {date}, epoch {epoch}", fontsize=16, y= 1.1)
     plt.tight_layout()
+    
     save_path = path.split('/')[-1].split('.')[0]
     if save:
         plt.savefig(f'{save_path}_{sample_type}_epoch_{epoch}.png', dpi=150, bbox_inches="tight")
     plt.show()
     plt.close()
-
+    
 def _add_shape(ax, segments, alpha=1.0, color="k"):
     """Helper function to add shapefile overlay to plot"""
     ax.add_collection(LineCollection(segments, colors=color, linewidths=0.6, zorder=6, alpha=alpha))
@@ -187,6 +315,7 @@ def extract_timestamp_from_path(path):
     ts = re.sub(r"\D", "", base)[:14]
     date = datetime.strptime(ts, "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
     return date
+
 
 def generate_realistic_gaps_simple(shape, tempo_mask, n_blobs=5, blob_size_range=(80, 200), threshold=0.5):
     """

@@ -2,31 +2,37 @@ import torch
 import numpy as np
 from sklearn.metrics import r2_score
 
-def calculate_metrics(pred, target, mask):
-    """Calculate RMSE, MAE, R² for the fake mask regions (where mask=0)"""
-    # Only consider the fake mask regions (where mask=0)
-    hole_mask = (1 - mask).bool()
+def calculate_metrics(pred, target, mask, known_mask):
+    """
+    Calculate RMSE, MAE, R² only for artificially masked regions that had valid TEMPO pixels
     
-    # Extract values in the fake mask regions
-    if hole_mask.sum() == 0:
-        return {'rmse': 0.0, 'mae': 0.0, 'r2': 0.0}  # No fake mask regions
+    Args:
+        pred: Model predictions
+        target: Ground truth target
+        mask: Current mask being used (fake_mask for training, known_mask for validation)
+        known_mask: Original TEMPO valid pixel mask (1=valid, 0=missing)
+    """
+    # For training: only consider artificial holes that were originally valid TEMPO pixels
+    # artificial_holes = pixels that are masked in current mask BUT were valid in known_mask
+    artificial_holes = (known_mask == 1) & (mask == 0)
+    
+    if artificial_holes.sum() == 0:
+        return {'rmse': 0.0, 'mae': 0.0, 'r2': 0.0}  # No artificial holes in valid TEMPO areas
         
-    pred_holes = pred[hole_mask]
-    target_holes = target[hole_mask]
+    pred_holes = pred[artificial_holes]
+    target_holes = target[artificial_holes]
     
     # Calculate metrics
     mse = torch.mean((pred_holes - target_holes) ** 2).item()
     rmse = np.sqrt(mse)
     mae = torch.mean(torch.abs(pred_holes - target_holes)).item()
     
-    # For R², convert to numpy for sklearn implementation
+    # For R², convert to numpy
     pred_np = pred_holes.detach().cpu().numpy()
     target_np = target_holes.detach().cpu().numpy()
     r2 = r2_score(target_np, pred_np) if len(pred_np) > 1 else 0.0
     
     return {'rmse': rmse, 'mae': mae, 'r2': r2}
-
-
 
 def warmup_loss(pred, target, mask):
     hole_mask = 1- mask

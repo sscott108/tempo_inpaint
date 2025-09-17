@@ -1,6 +1,6 @@
 import pickle
 
-def load_classification_pickle(input_file="/hpc/home/srs108/TEMPO/file_classification_nop.pkl"):
+def load_classification_pickle(input_file):
     """Load from pickle"""
     
     with open(input_file, 'rb') as f:
