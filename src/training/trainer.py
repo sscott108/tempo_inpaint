@@ -106,22 +106,23 @@ from ..utils.helpers import visualize_batch
 #     if best_state is not None:
 #         model.load_state_dict(best_state)
 #     return model
-def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50, patience=5):
+def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50, patience=5, writer=None):
     opt = torch.optim.Adam(model.parameters(), lr=1e-5)
     best_loss = float("inf")
     best_state = None
-    
     wait = 0
-
     history = []
     for epoch in range(epochs):
         # ---- Training ----
         model.train()
         train_loss = 0
-        train_metrics = {'rmse': 0.0, 'mae': 0.0, 'r2': 0.0}
-        batch_count = 0
+        train_metrics = {
+            'rmse': 0.0, 'mae': 0.0, 'r2': 0.0,
+            'pandora_rmse': 0.0, 'pandora_mae': 0.0, 'pandora_rho': 0.0, 'pandora_r2': 0.0,
+            'n_pandora_stations': 0}
+        train_batch_count = 0
         
-        for batch in tqdm(train_loader):
+        for batch in (train_loader):
             img = batch["masked_img"].cuda()          # img with both masks
             mask = batch["known_and_fake_mask"].cuda()      # real missing gaps and artificial gaps
             mask_aug = batch["fake_mask"].cuda()            # 1=kept, 0=artificial hole
@@ -141,32 +142,28 @@ def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50,
             train_loss += loss.item()
             
             # Calculate metrics for fake mask regions
-            batch_metrics = calculate_metrics(
-                pred_t, target, mask_aug, known_mask, 
-                p_mask=p_mask, p_values=p_val_map, normalizer=normalizer)
+            batch_metrics = calculate_metrics(pred_t, target, mask_aug, known_mask, 
+                                              p_mask=p_mask, p_values=p_val_map, normalizer=normalizer)
 
             for key in batch_metrics:
                 if key not in train_metrics:
                     train_metrics[key] = 0.0
                 train_metrics[key] += batch_metrics[key]
 
-            batch_count += 1
-            for key in train_metrics:
-                train_metrics[key] /= batch_count
-                
-#             visualize_batch(epoch, model,normalizer, train_loader, device="cuda",train=True, shp_path=shp_path,save=False)
-
-#             visualize_batch(epoch, model, normalizer, val_loader, device="cuda", train=False, shp_path=shp_path,save = False)
-        # Average metrics over batches
+            train_batch_count += 1
+        for key in train_metrics:train_metrics[key] /= train_batch_count
         train_loss /= len(train_loader)
-        for key in train_metrics:
-            train_metrics[key] /= batch_count
 
-        # ---- Validation ----
+ # ---- Validation (Simple Version) ----
         model.eval()
         val_loss = 0
-        batch_count = 0
-        
+        val_metrics = {
+            'rmse': 0.0, 'mae': 0.0, 'r2': 0.0,
+            'pandora_rmse': 0.0, 'pandora_mae': 0.0, 'pandora_rho': 0.0, 'pandora_r2': 0.0,
+            'n_pandora_stations': 0
+        }
+        val_batch_count = 0
+
         with torch.no_grad():
             for batch in tqdm(val_loader):
                 img = batch["masked_img"].cuda()
@@ -178,27 +175,85 @@ def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50,
                 if p_mask is not None:
                     p_mask = p_mask.cuda()
                     p_val_map = p_val_map.cuda() if p_val_map is not None else None
-                    
+
                 pred, _ = model(img, mask)
                 loss = warmup_loss(pred, target, mask)
                 val_loss += loss.item()
-                
-                # Calculate metrics for fake mask regions
-                batch_metrics = calculate_metrics(
-                pred_t, target, mask_aug, known_mask, 
-                p_mask=p_mask, p_values=p_val_map, normalizer=normalizer)
 
-                batch_metrics = calculate_metrics(pred, target, mask)
-                for key in batch_metrics:
+                # Calculate metrics for first sample in batch only (faster)
+                batch_metrics = calculate_metrics(
+                    pred, target, mask, mask,  # Use known_mask for both
+                    p_mask=p_mask, p_values=p_val_map, normalizer=normalizer,
+                    batch_idx=0  # Only process first sample
+                )
+
+                # Add to validation totals
+                for key in val_metrics:
                     val_metrics[key] += batch_metrics[key]
-                batch_count += 1
-                
+
+                val_batch_count += 1
+
+        # Average validation metrics and loss over all batches
         val_loss /= len(val_loader)
+        for key in val_metrics:
+            val_metrics[key] /= val_batch_count
+
+        # FIXED: Check if writer has add_scalar method (MetricsLogger) vs writerow (DictWriter)
+        if writer is not None:
+            if hasattr(writer, 'add_scalar'):
+                # This is a MetricsLogger or TensorBoard SummaryWriter
+                # Log scalar metrics
+                writer.add_scalar('Loss/Train', train_loss, epoch)
+                writer.add_scalar('Loss/Validation', val_loss, epoch)
+
+                # Log training metrics
+                writer.add_scalar('Metrics/Train_RMSE', train_metrics['rmse'], epoch)
+                writer.add_scalar('Metrics/Train_MAE', train_metrics['mae'], epoch)
+                writer.add_scalar('Metrics/Train_R2', train_metrics['r2'], epoch)
+
+                # Log Pandora metrics if available
+                if train_metrics['n_pandora_stations'] > 0:
+                    writer.add_scalar('Pandora/Train_RMSE', train_metrics['pandora_rmse'], epoch)
+                    writer.add_scalar('Pandora/Train_Rho', train_metrics['pandora_rho'], epoch)
+                    writer.add_scalar('Pandora/Train_R2', train_metrics['pandora_r2'], epoch)
+                    writer.add_scalar('Pandora/Train_Stations', train_metrics['n_pandora_stations'], epoch)
+
+                if val_metrics['n_pandora_stations'] > 0:
+                    writer.add_scalar('Pandora/Val_RMSE', val_metrics['pandora_rmse'], epoch)
+                    writer.add_scalar('Pandora/Val_Rho', val_metrics['pandora_rho'], epoch)
+                    writer.add_scalar('Pandora/Val_R2', val_metrics['pandora_r2'], epoch)
+                    writer.add_scalar('Pandora/Val_Stations', val_metrics['n_pandora_stations'], epoch)
+
+                # Log sample images occasionally (to avoid filling up disk)
+                if epoch % 10 == 0 and hasattr(writer, 'add_images'):
+                    try:
+                        # Get a sample batch
+                        sample_batch = next(iter(train_loader))
+                        sample_img = sample_batch["masked_img"][:1].cuda()
+                        sample_mask = sample_batch["known_and_fake_mask"][:1].cuda()
+                        sample_target = sample_batch["target"][:1].cuda()
+
+                        with torch.no_grad():
+                            sample_pred, _ = model(sample_img, sample_mask)
+
+                        # Normalize for display (0-1 range)
+                        def normalize_for_display(tensor):
+                            t = tensor.clone()
+                            t = (t - t.min()) / (t.max() - t.min() + 1e-8)
+                            return t
+
+                        writer.add_images('Images/Train_Input', normalize_for_display(sample_img), epoch)
+                        writer.add_images('Images/Train_Target', normalize_for_display(sample_target), epoch)
+                        writer.add_images('Images/Train_Prediction', normalize_for_display(sample_pred), epoch)
+
+                    except Exception as e:
+                        print(f"Warning: Could not log images to MetricsLogger: {e}")
+            else:
+                # This might be a different type of writer, skip logging or handle differently
+                print(f"Warning: Writer object {type(writer)} doesn't have add_scalar method")
        
-#         visualize_batch(epoch, model, normalizer, val_loader, device="cuda", train=False, shp_path=shp_path,save = False)
         print(f"Epoch {epoch+1}: Train {train_loss:.4f} | Val {val_loss:.4f}")
         print(f"Train metrics - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")   
-        print(f"Train metrics - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")
         
         if train_metrics['n_pandora_stations'] > 0:
             print(f"Train Pandora metrics - RMSE: {train_metrics['pandora_rmse']:.4E}, "
@@ -228,6 +283,13 @@ def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50,
             "pred_min_range": pred.min().item() if 'pred' in locals() else None,
             "pred_max_range": pred.max().item() if 'pred' in locals() else None
         })
+        
+        if epoch %10 == 0: 
+            visualize_batch(epoch=epoch,model=model,normalizer=normalizer,dataloader=train_loader,
+                    batch_idx=0,sample_idx=0,device="cuda",save=True,train=True,shp_path=shp_path)
+            
+            visualize_batch(epoch=epoch,model=model,normalizer=normalizer,dataloader=val_loader,
+                    batch_idx=0,sample_idx=0,device="cuda",save=True,train=False,shp_path=shp_path)
         
         with open('csv_history.csv', "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[

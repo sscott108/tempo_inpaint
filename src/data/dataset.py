@@ -435,7 +435,7 @@ class TempoPandoraInpaintDataset(Dataset):
             # Panel 1: Input (masked with all masks) + Pandora
             im0 = ax[0].imshow(np.ma.array(inp_np, mask=~all_masks), 
                               cmap=cmap_v, vmin=vmin, vmax=vmax, extent=[xmin, xmax, ymin, ymax])
-            ax[0].set_title(f"Input (all masks)\n{date}")
+            ax[0].set_title(f"Input {idx} (all masks)\n{date}")
             ax[0].set_xlim(xmin, xmax)
             ax[0].set_ylim(ymin, ymax)
             ax[0].set_aspect('equal')
@@ -480,7 +480,7 @@ class TempoPandoraInpaintDataset(Dataset):
 
                 ax[0].legend(handles=legend_handles, bbox_to_anchor=(-0.85, 1),
                             loc="upper left", borderaxespad=0., frameon=True,
-                            fontsize=10, markerscale=1.2)
+                            fontsize=15, markerscale=1.2)
 
             for a in ax[1:4]:  # Skip panels with geographic coords
                 a.axis("off")
@@ -495,7 +495,7 @@ class TempoPandoraInpaintDataset(Dataset):
             # Panel 1: Input (masked with known mask only) + Pandora
             im0 = ax[0].imshow(np.ma.array(inp_np, mask=~known_mask), 
                               cmap=cmap_v, vmin=vmin, vmax=vmax, extent=[xmin, xmax, ymin, ymax])
-            ax[0].set_title(f"Input (original mask)\n{date}")
+            ax[0].set_title(f"Input {idx} (original mask)\n{date} ")
             ax[0].set_xlim(xmin, xmax)
             ax[0].set_ylim(ymin, ymax)
             ax[0].set_aspect('equal')
@@ -532,7 +532,7 @@ class TempoPandoraInpaintDataset(Dataset):
 
                 ax[0].legend(handles=legend_handles, bbox_to_anchor=(-0.85, 1),
                             loc="upper left", borderaxespad=0., frameon=True,
-                            fontsize=10, markerscale=1.2)
+                            fontsize=15, markerscale=1.2)
 
             ax[1].axis("off")  # Only turn off axis for the middle panel
 
@@ -548,11 +548,12 @@ class TempoPandoraInpaintDataset(Dataset):
         img = np.nan_to_num(arr_valid, nan=0.0).astype(np.float64)
         H, W = img.shape
         img_n = self.normalizer.normalize_image(img) 
-        
+
         # ---------- Pandora anchors ----------
         pandora_mask = np.zeros((H, W), dtype=np.float32)
         pandora_val_map = np.zeros((H, W), dtype=np.float32)
         xy_list, val_list = [], []
+        station_names = []
 
         ts = self._parse_time_from_fname(os.path.basename(path))
         if (self.pandora_df is not None) and (ts is not pd.NaT):
@@ -566,7 +567,7 @@ class TempoPandoraInpaintDataset(Dataset):
                 if "station" in dfw.columns:
                     dfw["abs_dt"] = (dfw["datetime"] - ts).abs()
                     dfw = dfw.sort_values(["station","abs_dt"]).groupby("station", as_index=False).first()
-                    
+
                 # get row/col (prefer provided; else compute from lat/lon)
                 if ("row" in dfw.columns) and ("col" in dfw.columns):
                     rows = dfw["row"].astype(int).to_numpy()
@@ -590,19 +591,34 @@ class TempoPandoraInpaintDataset(Dataset):
                 rows, cols = rows[ok], cols[ok]
                 vals = dfw.loc[ok, "NO2"].astype(float).to_numpy()
 
-                # optional normalization for Pandora values
-                if hasattr(self.normalizer, "normalize_pandora_array"): vals_n = self.normalizer.normalize_pandora_array(vals.astype(np.float64)).astype(np.float32)
-                elif hasattr(self.normalizer, "normalize_pandora"): vals_n = np.array([self.normalizer.normalize_pandora(v) for v in vals], dtype=np.float32)
-                else: vals_n = vals.astype(np.float32)  # identity
+                # Get station names for valid coordinates - FIXED VERSION
+                dfw_ok = dfw.loc[ok].reset_index(drop=True)  # Filter dataframe to match valid coordinates
+                station_names_raw = dfw_ok["station"].astype(str).to_numpy() if "station" in dfw_ok.columns else []
 
-                for r, c, v_n in zip(rows, cols, vals_n):
+                # optional normalization for Pandora values
+                if hasattr(self.normalizer, "normalize_pandora_array"): 
+                    vals_n = self.normalizer.normalize_pandora_array(vals.astype(np.float64)).astype(np.float32)
+                elif hasattr(self.normalizer, "normalize_pandora"): 
+                    vals_n = np.array([self.normalizer.normalize_pandora(v) for v in vals], dtype=np.float32)
+                else: 
+                    vals_n = vals.astype(np.float32)  # identity
+
+                # Store Pandora data and station names
+                for i, (r, c, v_n) in enumerate(zip(rows, cols, vals_n)):
                     pandora_mask[r, c] = 1.0
                     pandora_val_map[r, c] = v_n
                     xy_list.append((int(r), int(c)))
+
+                    # Add corresponding station name
+                    if i < len(station_names_raw):
+                        station_names.append(station_names_raw[i])
+                    else:
+                        station_names.append(f"Unknown_{i}")
+
                 val_list = vals_n.tolist()
-                
+
         if self.train:
-            n_blobs= np.random.randint(0,5)
+            n_blobs = np.random.randint(0, 5)
             realistic_gaps = generate_realistic_gaps_simple(
                                     shape=(H, W), 
                                     tempo_mask=(known_mask),  # Your TEMPO valid pixel mask
@@ -613,16 +629,16 @@ class TempoPandoraInpaintDataset(Dataset):
 
             all_masks = known_mask * realistic_gaps
             img_with_holes = img_n * all_masks
-                        
 
             sample = {
                 "p_mask": torch.from_numpy(pandora_mask),
                 "p_val_mask": torch.from_numpy(pandora_val_map),
-                "masked_img": torch.from_numpy(img_with_holes).unsqueeze(0).float(),         #input image to model with all holes real and / or fake
-                "known_and_fake_mask": torch.from_numpy(all_masks).unsqueeze(0).float(),       # mask used in training, 
-                "known_mask": torch.from_numpy(known_mask).unsqueeze(0).float(),            # real missing pixels only, 1=pixel available, 0=no pixel available
-                "fake_mask": torch.from_numpy(realistic_gaps).unsqueeze(0).float(),          # salt/pepper holes
-                "target": torch.from_numpy(img_n).unsqueeze(0).float(),                  #image normed alone
+                "station_names": station_names,  # Add station names to sample
+                "masked_img": torch.from_numpy(img_with_holes).unsqueeze(0).float(),         
+                "known_and_fake_mask": torch.from_numpy(all_masks).unsqueeze(0).float(),       
+                "known_mask": torch.from_numpy(known_mask).unsqueeze(0).float(),            
+                "fake_mask": torch.from_numpy(realistic_gaps).unsqueeze(0).float(),          
+                "target": torch.from_numpy(img_n).unsqueeze(0).float(),                  
                 "path": path,
             }
             return sample
@@ -631,12 +647,53 @@ class TempoPandoraInpaintDataset(Dataset):
             sample = {
                 "p_mask": torch.from_numpy(pandora_mask),
                 "p_val_mask": torch.from_numpy(pandora_val_map),
-                "masked_img": torch.from_numpy(img_n).unsqueeze(0).float(),         #input image to model with all holes real and / or fake
-                "known_mask": torch.from_numpy(known_mask).unsqueeze(0).float(),            # real missing pixels only, 1=pixel available, 0=no pixel available
-                "target": torch.from_numpy(img_n).unsqueeze(0).float(),                  #image normed alone
-                "path": path}
-        
+                "station_names": station_names,  # Add station names to sample
+                "masked_img": torch.from_numpy(img_n).unsqueeze(0).float(),         
+                "known_mask": torch.from_numpy(known_mask).unsqueeze(0).float(),            
+                "target": torch.from_numpy(img_n).unsqueeze(0).float(),                  
+                "path": path
+            }
+
             return sample
+
+            if self.train:
+                n_blobs= np.random.randint(0,5)
+                realistic_gaps = generate_realistic_gaps_simple(
+                                        shape=(H, W), 
+                                        tempo_mask=(known_mask),  # Your TEMPO valid pixel mask
+                                        n_blobs=n_blobs, 
+                                        blob_size_range=(20, 74),  # Can make even larger
+                                        threshold=0.6
+                                    )
+
+                all_masks = known_mask * realistic_gaps
+                img_with_holes = img_n * all_masks
+
+
+                sample = {
+                    "p_mask": torch.from_numpy(pandora_mask),
+                    "p_val_mask": torch.from_numpy(pandora_val_map),
+                    "masked_img": torch.from_numpy(img_with_holes).unsqueeze(0).float(),         #input image to model with all holes real and / or fake
+                    "known_and_fake_mask": torch.from_numpy(all_masks).unsqueeze(0).float(),       # mask used in training, 
+                    "known_mask": torch.from_numpy(known_mask).unsqueeze(0).float(),            # real missing pixels only, 1=pixel available, 0=no pixel available
+                    "fake_mask": torch.from_numpy(realistic_gaps).unsqueeze(0).float(),          # salt/pepper holes
+                    "target": torch.from_numpy(img_n).unsqueeze(0).float(),                  #image normed alone
+                    "path": path,
+                    "station_names": station_names
+                }
+                return sample
+
+            else:
+                sample = {
+                    "p_mask": torch.from_numpy(pandora_mask),
+                    "p_val_mask": torch.from_numpy(pandora_val_map),
+                    "masked_img": torch.from_numpy(img_n).unsqueeze(0).float(),         #input image to model with all holes real and / or fake
+                    "known_mask": torch.from_numpy(known_mask).unsqueeze(0).float(),            # real missing pixels only, 1=pixel available, 0=no pixel available
+                    "target": torch.from_numpy(img_n).unsqueeze(0).float(),                  #image normed alone
+                    "path": path,
+                    "station_names": station_names}
+
+                return sample
         
 def _wrap_lon_180(lons):
     """Normalize longitudes to [-180, 180]."""
