@@ -2,124 +2,22 @@ import torch
 import torch.optim as optim
 import csv
 from tqdm import tqdm
-from ..losses.losses import warmup_loss, calculate_metrics
+from ..losses.losses import improved_loss, calculate_metrics
 from ..utils.helpers import visualize_batch
+import csv
 
-# def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50, patience=5):
-#     opt = torch.optim.Adam(model.parameters(), lr=1e-5)
-#     best_loss = float("inf")
-#     best_state = None
-    
-#     wait = 0
-
-#     history = []
-#     for epoch in range(epochs):
-#         # ---- Training ----
-#         model.train()
-#         train_loss = 0
-#         train_metrics = {'rmse': 0.0, 'mae': 0.0, 'r2': 0.0}
-#         batch_count = 0
-        
-#         for batch in tqdm(train_loader):
-#             img = batch["masked_img"].cuda()          # img with both masks
-#             mask = batch["known_and_fake_mask"].cuda()      # real missing gaps and artificial gaps
-#             mask_aug = batch["fake_mask"].cuda()            # 1=kept, 0=artificial hole
-#             known_mask = batch['known_mask'].cuda()
-#             target = batch["target"].cuda()
-
-#             pred_t, _ = model(img, mask_aug)
-#             loss = warmup_loss(pred_t, target, mask_aug)            
-            
-#             opt.zero_grad(); loss.backward(); opt.step()
-#             train_loss += loss.item()
-            
-#             # Calculate metrics for fake mask regions
-#             batch_metrics = calculate_metrics(pred_t, target, mask_aug, known_mask)
-#             for key in batch_metrics:
-#                 train_metrics[key] += batch_metrics[key]
-#             batch_count += 1
-#         visualize_batch(epoch, model,normalizer, train_loader, device="cuda",train=True, shp_path=shp_path,save=False)
-
-#         # Average metrics over batches
-#         train_loss /= len(train_loader)
-#         for key in train_metrics:
-#             train_metrics[key] /= batch_count
-
-#         # ---- Validation ----
-#         model.eval()
-#         val_loss = 0
-#         batch_count = 0
-        
-#         with torch.no_grad():
-#             for batch in tqdm(val_loader):
-#                 img = batch["masked_img"].cuda()
-#                 mask = batch["known_mask"].cuda()
-#                 target = batch["target"].cuda()
-#                 pred, _ = model(img, mask)
-
-#                 loss = warmup_loss(pred, target, mask)
-#                 val_loss += loss.item()
-                
-#                 # Calculate metrics for fake mask regions
-#                 batch_count += 1
-                
-#         val_loss /= len(val_loader)
-       
-#         visualize_batch(epoch, model, normalizer, val_loader, device="cuda", train=False, shp_path=shp_path,save = False)
-#         print(f"Epoch {epoch+1}: Train {train_loss:.4f} | Val {val_loss:.4f}")
-#         print(f"Train metrics - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")   
-        
-        
-#         # ---- Early stopping ----
-#         if val_loss < best_loss:
-#             best_loss = val_loss
-#             best_state = model.state_dict().copy()
-#             wait = 0
-#             torch.save(model.state_dict(), "pconvunet.pt")
-#         else:
-#             wait += 1
-#             if wait >= patience:
-#                 print(f"Early stopping at epoch {epoch+1}")
-#                 break
-                
-#         history.append({
-#             "epoch": epoch,
-#             "train_loss": train_loss,
-#             "val_loss": val_loss,
-#             "train_rmse": train_metrics['rmse'],
-#             "train_mae": train_metrics['mae'],
-#             "train_r2": train_metrics['r2'],
-#             "pred_min_range": pred.min().item() if 'pred' in locals() else None,
-#             "pred_max_range": pred.max().item() if 'pred' in locals() else None
-#         })
-        
-#         with open('csv_history.csv', "w", newline="") as f:
-#             writer = csv.DictWriter(f, fieldnames=[
-#                 "epoch", "train_loss", "val_loss", 
-#                 "train_rmse", "train_mae", "train_r2",
-#                 "pred_min_range", "pred_max_range"
-#             ])
-#             writer.writeheader()
-#             writer.writerows(history)
-        
-#     # Restore best weights
-#     if best_state is not None:
-#         model.load_state_dict(best_state)
-#     return model
-def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50, patience=5, writer=None):
+def train_model(model, normalizer, train_loader, val_loader, shp_path, epochs=50, patience=5):
     opt = torch.optim.Adam(model.parameters(), lr=1e-5)
     best_loss = float("inf")
     best_state = None
     wait = 0
     history = []
+    
     for epoch in range(epochs):
         # ---- Training ----
         model.train()
         train_loss = 0
-        train_metrics = {
-            'rmse': 0.0, 'mae': 0.0, 'r2': 0.0,
-            'pandora_rmse': 0.0, 'pandora_mae': 0.0, 'pandora_rho': 0.0, 'pandora_r2': 0.0,
-            'n_pandora_stations': 0}
+        train_metrics = {'rmse': 0.0, 'mae': 0.0, 'r2': 0.0,'pandora_rmse': 0.0, 'pandora_mae': 0.0, 'pandora_rho': 0.0, 'pandora_r2': 0.0,'n_pandora_stations': 0}
         train_batch_count = 0
         
         for batch in (train_loader):
@@ -128,8 +26,8 @@ def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50,
             mask_aug = batch["fake_mask"].cuda()            # 1=kept, 0=artificial hole
             known_mask = batch['known_mask'].cuda()
             target = batch["target"].cuda()
-            p_mask = batch.get("p_mask", None)
-            p_val_map = batch.get("p_val_mask", None)
+            p_mask = batch["p_mask"]
+            p_val_map = batch["p_val_mask"]
 
             # If Pandora data exists, move to device
             if p_mask is not None:
@@ -137,10 +35,10 @@ def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50,
                 p_val_map = p_val_map.cuda() if p_val_map is not None else None
 
             pred_t, _ = model(img, mask_aug)
-            loss = warmup_loss(pred_t, target, mask_aug)            
+            loss = improved_loss(pred_t, target, mask_aug)            
             opt.zero_grad(); loss.backward(); opt.step()
             train_loss += loss.item()
-            
+        
             # Calculate metrics for fake mask regions
             batch_metrics = calculate_metrics(pred_t, target, mask_aug, known_mask, 
                                               p_mask=p_mask, p_values=p_val_map, normalizer=normalizer)
@@ -151,40 +49,46 @@ def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50,
                 train_metrics[key] += batch_metrics[key]
 
             train_batch_count += 1
-        for key in train_metrics:train_metrics[key] /= train_batch_count
+#             visualize_batch(epoch=epoch, model=model, normalizer=normalizer, dataloader=train_loader,
+#                     batch_idx=0, sample_idx=0, device="cuda", save=False, train=True, shp_path=shp_path)
+            
+#             visualize_batch(epoch=epoch, model=model, normalizer=normalizer, dataloader=val_loader,
+#                     batch_idx=0, sample_idx=0, device="cuda", save=False, train=False, shp_path=shp_path)
+        
+            
+        for key in train_metrics:
+            train_metrics[key] /= train_batch_count
         train_loss /= len(train_loader)
 
- # ---- Validation (Simple Version) ----
+        # ---- Validation (Simple Version) ----
         model.eval()
         val_loss = 0
         val_metrics = {
-            'rmse': 0.0, 'mae': 0.0, 'r2': 0.0,
             'pandora_rmse': 0.0, 'pandora_mae': 0.0, 'pandora_rho': 0.0, 'pandora_r2': 0.0,
             'n_pandora_stations': 0
         }
         val_batch_count = 0
 
         with torch.no_grad():
-            for batch in tqdm(val_loader):
+            for batch in (val_loader):
                 img = batch["masked_img"].cuda()
                 mask = batch["known_mask"].cuda()
                 target = batch["target"].cuda()
-                p_mask = batch.get("p_mask", None)
-                p_val_map = batch.get("p_val_mask", None)
+                p_mask = batch["p_mask"]
+                p_val_map = batch["p_val_mask"]
 
                 if p_mask is not None:
                     p_mask = p_mask.cuda()
                     p_val_map = p_val_map.cuda() if p_val_map is not None else None
 
                 pred, _ = model(img, mask)
-                loss = warmup_loss(pred, target, mask)
+                loss = improved_loss(pred, target, mask)
                 val_loss += loss.item()
 
                 # Calculate metrics for first sample in batch only (faster)
                 batch_metrics = calculate_metrics(
                     pred, target, mask, mask,  # Use known_mask for both
                     p_mask=p_mask, p_values=p_val_map, normalizer=normalizer,
-                    batch_idx=0  # Only process first sample
                 )
 
                 # Add to validation totals
@@ -198,60 +102,6 @@ def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50,
         for key in val_metrics:
             val_metrics[key] /= val_batch_count
 
-        # FIXED: Check if writer has add_scalar method (MetricsLogger) vs writerow (DictWriter)
-        if writer is not None:
-            if hasattr(writer, 'add_scalar'):
-                # This is a MetricsLogger or TensorBoard SummaryWriter
-                # Log scalar metrics
-                writer.add_scalar('Loss/Train', train_loss, epoch)
-                writer.add_scalar('Loss/Validation', val_loss, epoch)
-
-                # Log training metrics
-                writer.add_scalar('Metrics/Train_RMSE', train_metrics['rmse'], epoch)
-                writer.add_scalar('Metrics/Train_MAE', train_metrics['mae'], epoch)
-                writer.add_scalar('Metrics/Train_R2', train_metrics['r2'], epoch)
-
-                # Log Pandora metrics if available
-                if train_metrics['n_pandora_stations'] > 0:
-                    writer.add_scalar('Pandora/Train_RMSE', train_metrics['pandora_rmse'], epoch)
-                    writer.add_scalar('Pandora/Train_Rho', train_metrics['pandora_rho'], epoch)
-                    writer.add_scalar('Pandora/Train_R2', train_metrics['pandora_r2'], epoch)
-                    writer.add_scalar('Pandora/Train_Stations', train_metrics['n_pandora_stations'], epoch)
-
-                if val_metrics['n_pandora_stations'] > 0:
-                    writer.add_scalar('Pandora/Val_RMSE', val_metrics['pandora_rmse'], epoch)
-                    writer.add_scalar('Pandora/Val_Rho', val_metrics['pandora_rho'], epoch)
-                    writer.add_scalar('Pandora/Val_R2', val_metrics['pandora_r2'], epoch)
-                    writer.add_scalar('Pandora/Val_Stations', val_metrics['n_pandora_stations'], epoch)
-
-                # Log sample images occasionally (to avoid filling up disk)
-                if epoch % 10 == 0 and hasattr(writer, 'add_images'):
-                    try:
-                        # Get a sample batch
-                        sample_batch = next(iter(train_loader))
-                        sample_img = sample_batch["masked_img"][:1].cuda()
-                        sample_mask = sample_batch["known_and_fake_mask"][:1].cuda()
-                        sample_target = sample_batch["target"][:1].cuda()
-
-                        with torch.no_grad():
-                            sample_pred, _ = model(sample_img, sample_mask)
-
-                        # Normalize for display (0-1 range)
-                        def normalize_for_display(tensor):
-                            t = tensor.clone()
-                            t = (t - t.min()) / (t.max() - t.min() + 1e-8)
-                            return t
-
-                        writer.add_images('Images/Train_Input', normalize_for_display(sample_img), epoch)
-                        writer.add_images('Images/Train_Target', normalize_for_display(sample_target), epoch)
-                        writer.add_images('Images/Train_Prediction', normalize_for_display(sample_pred), epoch)
-
-                    except Exception as e:
-                        print(f"Warning: Could not log images to MetricsLogger: {e}")
-            else:
-                # This might be a different type of writer, skip logging or handle differently
-                print(f"Warning: Writer object {type(writer)} doesn't have add_scalar method")
-       
         print(f"Epoch {epoch+1}: Train {train_loss:.4f} | Val {val_loss:.4f}")
         print(f"Train metrics - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")   
         
@@ -260,6 +110,12 @@ def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50,
                   f"MAE: {train_metrics['pandora_mae']:.4E}, "
                   f"ρ: {train_metrics['pandora_rho']:.2f}, "
                   f"R²: {train_metrics['pandora_r2']:.2f}")
+                  
+        if val_metrics['n_pandora_stations'] > 0:
+            print(f"Val Pandora metrics - RMSE: {val_metrics['pandora_rmse']:.4E}, "
+                  f"MAE: {val_metrics['pandora_mae']:.4E}, "
+                  f"ρ: {val_metrics['pandora_rho']:.2f}, "
+                  f"R²: {val_metrics['pandora_r2']:.2f}")
         
         # ---- Early stopping ----
         if val_loss < best_loss:
@@ -273,32 +129,49 @@ def train_model(model, normalizer,train_loader, val_loader, shp_path, epochs=50,
                 print(f"Early stopping at epoch {epoch+1}")
                 break
                 
-        history.append({
+        # Store all metrics in history
+        epoch_data = {
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "train_rmse": train_metrics['rmse'],
             "train_mae": train_metrics['mae'],
             "train_r2": train_metrics['r2'],
+            "train_pandora_rmse": train_metrics['pandora_rmse'],
+            "train_pandora_mae": train_metrics['pandora_mae'],
+            "train_pandora_rho": train_metrics['pandora_rho'],
+            "train_pandora_r2": train_metrics['pandora_r2'],
+            "train_n_pandora_stations": train_metrics['n_pandora_stations'],
+            "val_pandora_rmse": val_metrics['pandora_rmse'],
+            "val_pandora_mae": val_metrics['pandora_mae'],
+            "val_pandora_rho": val_metrics['pandora_rho'],
+            "val_pandora_r2": val_metrics['pandora_r2'],
+            "val_n_pandora_stations": val_metrics['n_pandora_stations'],
             "pred_min_range": pred.min().item() if 'pred' in locals() else None,
             "pred_max_range": pred.max().item() if 'pred' in locals() else None
-        })
+        }
+        history.append(epoch_data)
         
-        if epoch %10 == 0: 
-            visualize_batch(epoch=epoch,model=model,normalizer=normalizer,dataloader=train_loader,
-                    batch_idx=0,sample_idx=0,device="cuda",save=True,train=True,shp_path=shp_path)
+        if epoch % 2 == 0: 
+            visualize_batch(epoch=epoch, model=model, normalizer=normalizer, dataloader=train_loader,
+                    batch_idx=0, sample_idx=0, device="cuda", save=True, train=True, shp_path=shp_path)
             
-            visualize_batch(epoch=epoch,model=model,normalizer=normalizer,dataloader=val_loader,
-                    batch_idx=0,sample_idx=0,device="cuda",save=True,train=False,shp_path=shp_path)
+            visualize_batch(epoch=epoch, model=model, normalizer=normalizer, dataloader=val_loader,
+                    batch_idx=0, sample_idx=0, device="cuda", save=True, train=False, shp_path=shp_path)
+        
+        # Write all metrics to CSV
+        fieldnames = [
+            "epoch", "train_loss", "val_loss", 
+            "train_rmse", "train_mae", "train_r2",
+            "train_pandora_rmse", "train_pandora_mae", "train_pandora_rho", "train_pandora_r2", "train_n_pandora_stations",
+            "val_pandora_rmse", "val_pandora_mae", "val_pandora_rho", "val_pandora_r2", "val_n_pandora_stations",
+            "pred_min_range", "pred_max_range"
+        ]
         
         with open('csv_history.csv', "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "epoch", "train_loss", "val_loss", 
-                "train_rmse", "train_mae", "train_r2",
-                "pred_min_range", "pred_max_range"
-            ])
-            writer.writeheader()
-            writer.writerows(history)
+            csv_writer = csv.DictWriter(f, fieldnames=fieldnames)
+            csv_writer.writeheader()
+            csv_writer.writerows(history)
         
     # Restore best weights
     if best_state is not None:

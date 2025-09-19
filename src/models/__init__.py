@@ -3,5 +3,6 @@
 Neural network models for satellite image inpainting.
 """
 from .pconv_unet import PConvUNet2D
+from .pconv_att import OriginalPlusMinimalAttention
 
-__all__ = ['PConvUNet2D']
+__all__ = ['PConvUNet2D', 'OriginalPlusMinimalAttention']

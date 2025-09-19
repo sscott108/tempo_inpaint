@@ -1,5 +1,5 @@
 import pickle
-
+import torch
 def load_classification_pickle(input_file):
     """Load from pickle"""
     
