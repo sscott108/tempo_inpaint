@@ -7,7 +7,7 @@ import rasterio
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
-
+import scipy
 from ..utils.helpers import extract_timestamp_from_path, load_shapefile_segments_pyshp, generate_realistic_gaps_simple
 
 
@@ -243,7 +243,12 @@ class TempoPandoraInpaintDataset(Dataset):
                  treat_zeros_as_missing=False,
                  valid_range=None,
                 pandora_csv=None,
-                time_tolerance="30min"):
+                time_tolerance="30min",
+                n_blobs_range=(1, 5),
+                sigma_xy_range=(5.0, 25.0),  # Spatial smoothing range
+                thr_range=(0.3, 0.7),       # Threshold range for hole creation
+                use_blob_gaps=True):
+        
         self.tif_dir = tif_dir
         self.train= train
         self.normalizer = normalizer
@@ -263,6 +268,14 @@ class TempoPandoraInpaintDataset(Dataset):
         self.files = [self.files[i] for i in order]
         self.timestamps = [self.timestamps[i] for i in order]
         
+        self.n_blobs_range = n_blobs_range
+        self.sigma_xy_range = sigma_xy_range
+        self.thr_range = thr_range
+        self.use_blob_gaps = use_blob_gaps
+        self.current_epoch = 0
+        self.max_epochs = 1  # will be updated in training loop
+
+        
         # --------- Pandora table ----------
         self.pandora_df = None
         self.time_tolerance = pd.Timedelta(time_tolerance)
@@ -277,6 +290,7 @@ class TempoPandoraInpaintDataset(Dataset):
             df = df.sort_values("datetime").reset_index(drop=True)
             self.pandora_df = df
 
+        
     # ---------- core I/O & masking ----------
     def _read_band_masked(self, path):
         with rasterio.open(path) as src:
@@ -538,8 +552,83 @@ class TempoPandoraInpaintDataset(Dataset):
 
             plt.tight_layout()
             plt.show()
-        
-    # ---------- torch Dataset API ----------
+            
+    
+    def _make_2d_blob_mask(
+        self, H, W, keep_mask_2d, rng,
+        min_frac=0.05, max_frac=0.25,              # desired coverage bounds (0–1)
+        n_blobs_range=(1, 4),                      # how many “clouds” to sum
+        sigma_xy_range=(8, 30),                    # smoothing (pixels) for 400×400
+        multiscale=True                            # add a second, coarser octave
+    ):
+        """
+        Return a 2D keep mask [H,W] (1=keep, 0=artificial hole) whose hole
+        coverage is <= max_frac *within* the originally valid TEMPO region.
+        """
+        # ----- 0) Nothing to do? -----
+        n_blobs = int(rng.integers(n_blobs_range[0], n_blobs_range[1]+1))
+        if n_blobs <= 0:
+            return np.ones((H, W), dtype=np.float32)
+
+        # ----- 1) Build a smooth “cloud” field -----
+        field = np.zeros((H, W), dtype=np.float32)
+        for _ in range(n_blobs):
+            noise = rng.standard_normal((H, W)).astype(np.float32)
+            sigma = float(rng.uniform(*sigma_xy_range))
+            field += scipy.ndimage.gaussian_filter(noise, sigma=sigma, mode="nearest")
+
+            if multiscale:
+                # a coarser octave makes blobs more cloud-like
+                noise2 = rng.standard_normal((H, W)).astype(np.float32)
+                sigma2 = sigma * 1.8
+                field += 0.6 * scipy.ndimage.gaussian_filter(noise2, sigma=sigma2, mode="nearest")
+
+        # Normalize to [0,1]
+        fmin, fmax = np.min(field), np.max(field)
+        if fmax > fmin:
+            field = (field - fmin) / (fmax - fmin)
+        else:
+            field = np.full((H, W), 0.5, dtype=np.float32)
+
+        # ----- 2) Choose a target fraction and compute quantile threshold -----
+        maskable = (keep_mask_2d.astype(bool))
+        vals = field[maskable]
+        if vals.size == 0:
+            return np.ones((H, W), dtype=np.float32)
+
+        target_frac = float(rng.uniform(min_frac, max_frac))  # variability per image
+        # threshold so that ~target_frac of maskable pixels become holes
+        thr = np.quantile(vals, 1.0 - target_frac)
+
+        # Create holes & cap to max_frac (robust to numerical drift)
+        holes = (field >= thr) & maskable
+        # If we overshoot slightly, tighten threshold to max_frac
+        if holes.mean() > max_frac:
+            thr_cap = np.quantile(vals, 1.0 - max_frac)
+            holes = (field >= thr_cap) & maskable
+
+        # Convert to keep mask
+        keep = np.ones((H, W), dtype=np.float32)
+        keep[holes] = 0.0
+
+        # Optional: soften edges a bit (looks more like clouds)
+        # keep = scipy.ndimage.gaussian_filter(keep, sigma=0.8)
+        # keep = (keep > 0.5).astype(np.float32)
+
+        return keep
+    def _make_progressive_mask(self, H, W, keep_mask_2d, rng, epoch, max_epochs):
+        # compute progression factor
+        frac = min(epoch / max_epochs, 1.0)  # goes 0 → 1
+        # interpolate mask coverage
+        max_cover = 0.25  # 25% max
+        min_cover = 0.05  # 5% start
+        cover_frac = min_cover + frac * (max_cover - min_cover)
+
+        # call your _make_2d_blob_mask with threshold tuned to hit cover_frac
+        keep = self._make_2d_blob_mask(H, W, keep_mask_2d, rng)
+        # optionally re-balance threshold until keep.mean() ≈ 1 - cover_frac
+        return keep
+
     def __len__(self): return len(self.files)
 
     def __getitem__(self, idx):     
@@ -548,6 +637,12 @@ class TempoPandoraInpaintDataset(Dataset):
         img = np.nan_to_num(arr_valid, nan=0.0).astype(np.float64)
         H, W = img.shape
         img_n = self.normalizer.normalize_image(img) 
+        
+        
+        
+        # in __getitem__ of Dataset
+
+
 
         # ---------- Pandora anchors ----------
         pandora_mask = np.zeros((H, W), dtype=np.float32)
@@ -609,7 +704,6 @@ class TempoPandoraInpaintDataset(Dataset):
                     pandora_val_map[r, c] = v_n
                     xy_list.append((int(r), int(c)))
 
-                    # Add corresponding station name
                     if i < len(station_names_raw):
                         station_names.append(station_names_raw[i])
                     else:
@@ -618,15 +712,12 @@ class TempoPandoraInpaintDataset(Dataset):
                 val_list = vals_n.tolist()
 
         if self.train:
-            n_blobs = np.random.randint(0, 5)
-            realistic_gaps = generate_realistic_gaps_simple(
-                                    shape=(H, W), 
-                                    tempo_mask=(known_mask),  # Your TEMPO valid pixel mask
-                                    n_blobs=n_blobs, 
-                                    blob_size_range=(20, 74),  # Can make even larger
-                                    threshold=0.6
-                                )
-
+            if self.use_blob_gaps:
+                # Use cloud-like blob gaps
+                rng = np.random.default_rng()
+                realistic_gaps = self._make_progressive_mask(H,W,known_mask, rng, 
+                                                   epoch=self.current_epoch, max_epochs = self.max_epochs)
+#                 realistic_gaps = self._make_2d_blob_mask(H, W, known_mask, rng)
             all_masks = known_mask * realistic_gaps
             img_with_holes = img_n * all_masks
 
@@ -656,45 +747,7 @@ class TempoPandoraInpaintDataset(Dataset):
 
             return sample
 
-            if self.train:
-                n_blobs= np.random.randint(0,5)
-                realistic_gaps = generate_realistic_gaps_simple(
-                                        shape=(H, W), 
-                                        tempo_mask=(known_mask),  # Your TEMPO valid pixel mask
-                                        n_blobs=n_blobs, 
-                                        blob_size_range=(20, 74),  # Can make even larger
-                                        threshold=0.6
-                                    )
 
-                all_masks = known_mask * realistic_gaps
-                img_with_holes = img_n * all_masks
-
-
-                sample = {
-                    "p_mask": torch.from_numpy(pandora_mask),
-                    "p_val_mask": torch.from_numpy(pandora_val_map),
-                    "masked_img": torch.from_numpy(img_with_holes).unsqueeze(0).float(),         #input image to model with all holes real and / or fake
-                    "known_and_fake_mask": torch.from_numpy(all_masks).unsqueeze(0).float(),       # mask used in training, 
-                    "known_mask": torch.from_numpy(known_mask).unsqueeze(0).float(),            # real missing pixels only, 1=pixel available, 0=no pixel available
-                    "fake_mask": torch.from_numpy(realistic_gaps).unsqueeze(0).float(),          # salt/pepper holes
-                    "target": torch.from_numpy(img_n).unsqueeze(0).float(),                  #image normed alone
-                    "path": path,
-                    "station_names": station_names
-                }
-                return sample
-
-            else:
-                sample = {
-                    "p_mask": torch.from_numpy(pandora_mask),
-                    "p_val_mask": torch.from_numpy(pandora_val_map),
-                    "masked_img": torch.from_numpy(img_n).unsqueeze(0).float(),         #input image to model with all holes real and / or fake
-                    "known_mask": torch.from_numpy(known_mask).unsqueeze(0).float(),            # real missing pixels only, 1=pixel available, 0=no pixel available
-                    "target": torch.from_numpy(img_n).unsqueeze(0).float(),                  #image normed alone
-                    "path": path,
-                    "station_names": station_names}
-
-                return sample
-        
 def _wrap_lon_180(lons):
     """Normalize longitudes to [-180, 180]."""
     arr = np.asarray(lons, dtype=float)

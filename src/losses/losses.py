@@ -2,24 +2,12 @@ import torch
 import numpy as np
 from sklearn.metrics import r2_score
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+
+EPS = 1e-8
 
 def calculate_metrics(pred, target, mask, known_mask, p_mask=None, p_values=None, normalizer=None):
-    """
-    Calculate RMSE, MAE, R² for artificially masked regions and Pandora stations
-    
-    Args:
-        pred: Model predictions [B,C,H,W]
-        target: Ground truth target [B,C,H,W]
-        mask: Current mask being used (fake_mask for training, known_mask for validation) [B,C,H,W]
-        known_mask: Original TEMPO valid pixel mask (1=valid, 0=missing) [B,C,H,W]
-        p_mask: Pandora mask (1=station location, 0=no station) [B,H,W] or None
-        p_values: Normalized Pandora values at station locations [B,H,W] or None
-        normalizer: Normalizer class with denormalize_pandora or denormalize_pandora_array methods
-    
-    Returns:
-        dict: Dictionary with RMSE, MAE, R² for artificial holes and Pandora stations
-    """
-    # Initialize results dictionary
+
     metrics = {
         'rmse': 0.0, 
         'mae': 0.0, 
@@ -146,6 +134,44 @@ def calculate_metrics(pred, target, mask, known_mask, p_mask=None, p_values=None
     
     return metrics
 
+
+def _dilate_mask(bin_mask, k=3):
+    """bin_mask: [B,1,H,W], 0/1. Returns dilated binary mask."""
+    pad = k // 2
+    kernel = torch.ones(1, 1, k, k, device=bin_mask.device, dtype=bin_mask.dtype)
+    hits = F.conv2d(bin_mask, kernel, padding=pad)
+    return (hits > 0).float()
+
+def _finite_diff_xy(x):
+    dy = x[:, :, 1:, :] - x[:, :, :-1, :]
+    dx = x[:, :, :, 1:] - x[:, :, :, :-1]
+    return dy, dx
+
+def boundary_ring_loss(pred, target, hole_mask, ring_width=5, w_val=1.0, w_grad=1.0, eps=1e-8):
+    """
+    pred/target: [B,1,H,W], hole_mask: [B,1,H,W] with 1=hole, 0=known.
+    """
+    hole = (hole_mask > 0.5).float()
+    ring = _dilate_mask(hole, k=ring_width) - hole
+    ring = (ring > 0.5).float()  # [B,1,H,W]
+
+    # value continuity on ring
+    val_err = torch.abs(pred - target) * ring
+    val_term = val_err.sum() / (ring.sum() + eps)
+
+    # gradient continuity on ring (align overlapping pixels)
+    dy_p, dx_p = _finite_diff_xy(pred)
+    dy_t, dx_t = _finite_diff_xy(target)
+
+    ring_y = ring[:, :, 1:, :] * ring[:, :, :-1, :]
+    ring_x = ring[:, :, :, 1:] * ring[:, :, :, :-1]
+
+    gy = torch.abs(dy_p - dy_t) * ring_y
+    gx = torch.abs(dx_p - dx_t) * ring_x
+    grad_term = (gy.sum() + gx.sum()) / (ring_y.sum() + ring_x.sum() + eps)
+
+    return w_val * val_term + w_grad * grad_term
+
 def gradient_loss(pred, target, mask=None):
     """Penalize large gradients to encourage smoothness"""
     # Calculate gradients
@@ -178,16 +204,140 @@ def total_variation_loss(pred, mask=None):
     
     return torch.mean(dy) + torch.mean(dx)
 
-# Updated loss function
-def improved_loss(pred, target, mask):
-    # Main reconstruction loss
+def improved_loss_progress(pred, target, mask, epoch, max_epochs):
     hole_mask = (mask == 0).float()
+
+    # Core losses
     l1_loss = F.l1_loss(pred * hole_mask, target * hole_mask)
-    
-    # Smoothness losses
     grad_loss = gradient_loss(pred, target, mask)
-    tv_loss = total_variation_loss(pred, mask)
-    
-    # Combine losses
-    total_loss = l1_loss + 0.1 * grad_loss + 0.05 * tv_loss
+    tv_loss   = total_variation_loss(pred, mask)
+    L_ring    = boundary_ring_loss(pred, target, hole_mask, ring_width=3)
+
+    # Multi-scale high-frequency loss
+    loss_hf = (
+        1.0 * highfreq_loss(pred, target, sigma=1) +
+        0.5 * highfreq_loss(pred, target, sigma=2) +
+        0.25 * highfreq_loss(pred, target, sigma=4)
+    )
+
+    # Progress factor
+    frac = min(epoch / max_epochs, 1.0)
+
+    # Stage weighting
+    # Early: reconstruction-heavy
+    # Mid: boundary + smoothness
+    # Late: details & texture dominate
+    w_l1   = 1.0 - 0.3*frac          # decay L1 over time
+    w_grad = 0.05 + 0.05*frac        # small, steady
+    w_tv   = 0.02 + 0.05*frac        # small, steady
+    w_ring = 0.0 + 0.2*frac          # kicks in mid → late
+    w_hf   = 0.1 + 0.2*frac          # grows with training
+
+    total_loss = (
+        w_l1   * l1_loss +
+        w_grad * grad_loss +
+        w_tv   * tv_loss +
+        w_ring * L_ring +
+        w_hf   * loss_hf
+    )
+
     return total_loss
+
+
+def highfreq_loss(pred, target, sigma=6):
+    # Kernel size should be odd and ≈ 6*sigma
+    ksize = int(2 * round(3 * sigma) + 1)
+
+    # Apply Gaussian blur
+    pred_lp = TF.gaussian_blur(pred, kernel_size=ksize, sigma=sigma)
+    target_lp = TF.gaussian_blur(target, kernel_size=ksize, sigma=sigma)
+
+    # High-pass residuals
+    pred_hp = pred - pred_lp
+    target_hp = target - target_lp
+
+    return F.l1_loss(pred_hp, target_hp)
+
+def improved_loss_progress(pred, target, mask, epoch, max_epochs, d_fake=None):
+    """
+    pred: model output
+    target: ground truth
+    mask: binary keep mask (1=keep, 0=hole)
+    epoch, max_epochs: for scheduling
+    d_fake: optional discriminator output for adversarial term
+    """
+    hole_mask  = (mask == 0).float()
+    valid_mask = (mask > 0).float()
+
+    # Pixelwise reconstruction losses
+    l1_hole  = F.l1_loss(pred * hole_mask,  target * hole_mask)
+    l1_valid = F.l1_loss(pred * valid_mask, target * valid_mask)
+
+    # Core regularization terms
+    grad_loss = gradient_loss(pred, target, mask)
+    tv_loss   = total_variation_loss(pred, mask)
+    L_ring    = boundary_ring_loss(pred, target, hole_mask, ring_width=3)
+
+    # Multi-scale high-frequency loss
+    loss_hf = (
+        1.0  * highfreq_loss(pred, target, sigma=1) +
+        0.5  * highfreq_loss(pred, target, sigma=2) +
+        0.25 * highfreq_loss(pred, target, sigma=4)
+    )
+
+    # Training progression (0 → 1)
+    frac = min(epoch / max_epochs, 1.0)
+
+    # ---------------------------
+    # Phase-based scheduling
+    # ---------------------------
+    # Phase 1: Pure reconstruction (0–20%)
+    # Phase 2: Introduce texture + boundary + adversarial (20–60%)
+    # Phase 3: Texture + adversarial dominate (60–100%)
+
+    if frac < 0.2:  # Phase 1
+        w_hole, w_valid = 1.0, 0.1
+        w_grad, w_tv, w_ring, w_hf, w_adv = 0.05, 0.05, 0.0, 0.0, 0.0
+
+    elif frac < 0.6:  # Phase 2
+        progress = (frac - 0.2) / 0.4  # 0 → 1 across 20–60%
+        w_hole  = 1.0 - 0.2 * progress
+        w_valid = 0.1 + 0.3 * progress   # grows to ~0.4
+        w_grad  = 0.05 + 0.05 * progress
+        w_tv    = 0.05 * (1 - progress)  # decays
+        w_ring  = 0.2 * progress
+        w_hf    = 0.1 + 0.2 * progress
+        w_adv   = 0.0 + 0.3 * progress   # delayed ramp
+
+    else:  # Phase 3
+        progress = (frac - 0.6) / 0.4  # 0 → 1 across 60–100%
+        w_hole  = 0.8 - 0.2 * progress
+        w_valid = 0.4 + 0.1 * progress   # ends ~0.5
+        w_grad  = 0.1
+        w_tv    = 0.02 * (1 - progress)  # fades out
+        w_ring  = 0.2 + 0.2 * progress   # up to 0.4
+        w_hf    = 0.3 + 0.2 * progress   # up to 0.5
+        w_adv   = 0.3 + 0.1 * progress   # up to 0.4
+
+    # Reconstruction loss (with dynamic valid weighting)
+    l1_loss = w_hole * l1_hole + w_valid * l1_valid
+
+    # Total generator loss
+    total_loss = (
+        l1_loss +
+        w_grad * grad_loss +
+        w_tv   * tv_loss +
+        w_ring * L_ring +
+        w_hf   * loss_hf
+    )
+
+    # Add adversarial term if discriminator is active
+    if d_fake is not None and w_adv > 0:
+        loss_G_adv = g_adv_loss(d_fake)
+        total_loss += w_adv * loss_G_adv
+
+    return total_loss
+
+
+def d_loss(d_real, d_fake): return 0.5 * (torch.mean((d_real - 1)**2) + torch.mean(d_fake**2))
+def g_adv_loss(d_fake): return torch.mean((d_fake - 1)**2)

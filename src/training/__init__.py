@@ -2,6 +2,6 @@
 """
 Dataset and data processing tools for satellite imagery.
 """
-from .trainer import train_model
+from .trainer import train_model, train_gan_model
 
-__all__ = ['train_model']
+__all__ = ['train_model', 'train_gan_model']

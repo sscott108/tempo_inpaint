@@ -16,8 +16,66 @@ from pyproj import CRS, Transformer
 from scipy import stats
 from rasterio.transform import array_bounds
 from rasterio.plot import show as rio_show
+import matplotlib.cm as cm
+from matplotlib import patheffects as pe
+from matplotlib.lines import Line2D
 
 
+def _wrap_lon_180(lons):
+    """Normalize longitudes to [-180, 180]."""
+    arr = np.asarray(lons, dtype=float)
+    m = np.isfinite(arr)
+    arr[m] = ((arr[m] + 180.0) % 360.0) - 180.0
+    return arr
+def _lonlat_to_rowcol_vec(lons, lats, transform, raster_crs):
+
+    lons = np.asarray(lons, dtype=float)
+    lats = np.asarray(lats, dtype=float)
+    # mask invalid inputs
+    good = np.isfinite(lons) & np.isfinite(lats)
+    rows = np.full_like(lons, fill_value=np.nan, dtype=float)
+    cols = np.full_like(lons, fill_value=np.nan, dtype=float)
+
+    if not good.any(): return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+    try:
+        from pyproj import CRS, Transformer
+        src = CRS.from_epsg(4326)  # Pandora files give lon/lat in WGS84
+        dst = raster_crs if raster_crs is not None else CRS.from_epsg(4326)
+        if not isinstance(dst, CRS):
+            dst = CRS.from_user_input(dst)
+        xf = Transformer.from_crs(src, dst, always_xy=True)
+        xs, ys = xf.transform(lons[good], lats[good])
+    except Exception:
+        # Fallback: assume raster is already in lon/lat
+        xs, ys = lons[good], lats[good]
+
+    # Affine inverse: xy -> col,row
+    inv = ~transform
+    cc = []; rr = []
+    for x, y in zip(xs, ys):
+        c, r = inv * (x, y)
+        cc.append(c); rr.append(r)
+    cols[good] = np.round(cc)
+    rows[good] = np.round(rr)
+
+    # keep only valid converted points
+    rows_i = rows[good].astype(np.int32)
+    cols_i = cols[good].astype(np.int32)
+    return rows_i, cols_i
+
+
+def _rowcol_to_xy_vec(rows, cols, transform):
+    """
+    Vectorized: pixel row/col -> raster xy using the affine transform.
+    """
+    rows = np.asarray(rows, dtype=float)
+    cols = np.asarray(cols, dtype=float)
+    xs, ys = [], []
+    for r, c in zip(rows, cols):
+        x, y = transform * (c, r)
+        xs.append(x); ys.append(y)
+    return np.asarray(xs), np.asarray(ys)
 
 def _add_shape(ax, segments, alpha=1.0, color="k"):
     """Helper function to add shapefile overlay to plot"""
@@ -238,7 +296,7 @@ def visualize_batch(epoch, model, normalizer, dataloader, batch_idx=0, sample_id
     
     
     from scipy.ndimage import gaussian_filter
-    pred_np_smooth = gaussian_filter(pred_np, sigma=0.8)
+#     pred_np_smooth = gaussian_filter(pred_np, sigma=0.8)
     
     # Only smooth the filled areas
     
@@ -250,7 +308,7 @@ def visualize_batch(epoch, model, normalizer, dataloader, batch_idx=0, sample_id
         
     hole_mask = ~mask_np
     pred_np_final = pred_np.copy()
-    pred_np_final[hole_mask] = pred_np_smooth[hole_mask]
+    pred_np_final[hole_mask] = pred_np[hole_mask]
     # Extract metadata - FOLLOWING DATASET APPROACH
     path = sample["path"]
     date = path.split('/')[-1].split('.')[0]
@@ -352,7 +410,7 @@ def visualize_batch(epoch, model, normalizer, dataloader, batch_idx=0, sample_id
 
                     # Plot with white halo + black edge
                     ax.scatter(x, y, s=110, marker='D', color='white', zorder=4, linewidths=0)
-                    sc = ax.scatter(x, y, s=80, marker='D', color=c, edgecolor='k', linewidth=0.8, zorder=5)
+                    sc = ax.scatter(x, y, s=50, marker='D', color=c, edgecolor='k', linewidth=0.8, zorder=5)
 
                     # Add path effects for visibility
                     sc.set_path_effects([pe.Stroke(linewidth=1.4, foreground='white'), pe.Normal()])
@@ -369,7 +427,7 @@ def visualize_batch(epoch, model, normalizer, dataloader, batch_idx=0, sample_id
         return legend_handles
 
     if train:
-        sample_type = "Training"
+        sample_type = "tr"
         
         # Calculate gap statistics and RMSE for training
         known_mask_np = mask_obs_np
@@ -465,7 +523,7 @@ def visualize_batch(epoch, model, normalizer, dataloader, batch_idx=0, sample_id
         ax[3].axis("off")
         
     else:
-        sample_type = "Validation"
+        sample_type = "val"
         
         val_title = f"Reconstruction\n{date}"
         if pandora_rmse is not None:
@@ -553,9 +611,9 @@ def visualize_batch(epoch, model, normalizer, dataloader, batch_idx=0, sample_id
     plt.close()
     
     # Print metrics
-    if pandora_rmse is not None:
-        print(f"Pandora RMSE: {pandora_rmse:.4E} ({n_pandora_stations} stations)")
-        if pandora_rho is not None:
-            print(f"Pandora correlation (ρ): {pandora_rho:.3f}")
+#     if pandora_rmse is not None:
+#         print(f"Pandora RMSE: {pandora_rmse:.4E} ({n_pandora_stations} stations)")
+#         if pandora_rho is not None:
+#             print(f"Pandora correlation (ρ): {pandora_rho:.3f}")
     
     return pandora_rho, pandora_rmse
