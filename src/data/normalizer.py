@@ -1,5 +1,5 @@
 import numpy as np
-
+import rasterio
 class Normalizer:
     """
     Image normalization (log1p + robust/global z) + Pandora normalization.
